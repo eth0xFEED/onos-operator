@@ -17,19 +17,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
+
 	"github.com/onosproject/onos-lib-go/pkg/logging"
 	topoapi "github.com/onosproject/onos-operator/pkg/apis/topo"
 	topoctrl "github.com/onosproject/onos-operator/pkg/controller/topo"
-	"github.com/onosproject/onos-operator/pkg/controller/topo/entity"
-	"github.com/onosproject/onos-operator/pkg/controller/topo/kind"
-	"github.com/onosproject/onos-operator/pkg/controller/topo/relation"
-	"github.com/onosproject/onos-operator/pkg/controller/topo/service"
 	"github.com/onosproject/onos-operator/pkg/controller/util/k8s"
 	"github.com/onosproject/onos-operator/pkg/controller/util/leader"
 	"github.com/onosproject/onos-operator/pkg/controller/util/ready"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	"os"
-	"runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
@@ -89,24 +86,6 @@ func main() {
 
 	// Add controllers to the manager
 	if err := topoctrl.AddControllers(mgr); err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-
-	// Setup all Controllers
-	if err := entity.Add(mgr); err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	if err := kind.Add(mgr); err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	if err := relation.Add(mgr); err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	if err := service.Add(mgr); err != nil {
 		log.Error(err)
 		os.Exit(1)
 	}

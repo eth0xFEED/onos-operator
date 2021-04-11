@@ -16,13 +16,13 @@ package relation
 
 import (
 	"context"
+
 	"github.com/onosproject/onos-api/go/onos/topo"
 	"github.com/onosproject/onos-lib-go/pkg/errors"
 	"github.com/onosproject/onos-lib-go/pkg/logging"
 	"github.com/onosproject/onos-operator/pkg/apis/topo/v1beta1"
 	"github.com/onosproject/onos-operator/pkg/controller/util/grpc"
 	"github.com/onosproject/onos-operator/pkg/controller/util/k8s"
-	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,6 +45,7 @@ const topoFinalizer = "topo"
 // Add creates a new Relation controller and adds it to the Manager. The Manager will set fields on the
 // controller and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
+
 	r := &Reconciler{
 		client: mgr.GetClient(),
 		scheme: mgr.GetScheme(),
@@ -71,6 +72,15 @@ func Add(mgr manager.Manager) error {
 		return err
 	}
 
+	// Connect to the topology service
+	conn, err := grpc.ConnectAddress("onos-topo:5150")
+	if err != nil {
+		log.Errorf("grpc dial topo svc error requeueing %#v", err)
+		return err
+	}
+
+	r.topoClient = topo.NewTopoClient(conn)
+
 	return nil
 }
 
@@ -78,91 +88,96 @@ var _ reconcile.Reconciler = &Reconciler{}
 
 // Reconciler reconciles a Relation object
 type Reconciler struct {
-	client client.Client
-	scheme *runtime.Scheme
-	config *rest.Config
+	client     client.Client
+	scheme     *runtime.Scheme
+	config     *rest.Config
+	topoClient topo.TopoClient
 }
 
 // Reconcile reads that state of the cluster for a Relation object and makes changes based on the state read
 // and what is in the Relation.Spec
 func (r *Reconciler) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	log.Infof("Reconciling Relation %s/%s", request.Namespace, request.Name)
-
 	// Fetch the Relation instance
 	relation := &v1beta1.Relation{}
 	err := r.client.Get(context.TODO(), request.NamespacedName, relation)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
+			log.Debugf("NOT REQUEUE Relation not found %s/%s", request.Namespace, request.Name)
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
 			return reconcile.Result{}, nil
 		}
+		log.Debugf("DO REQUEUE Relation error %s/%s %+v", request.Namespace, request.Name, err.Error())
 		// Error reading the object - requeue the request.
 		return reconcile.Result{}, err
 	}
 
-	if relation.DeletionTimestamp == nil {
-		return r.reconcileCreate(relation)
+	if relation.DeletionTimestamp != nil {
+		log.Debugf("RECONCILE deltimestamp nil - DELETE Relation error %s/%s %+v", request.Namespace, request.Name, relation.DeletionTimestamp)
+		return r.reconcileDelete(relation)
 	}
-	return r.reconcileDelete(relation)
+	if r.relationExists(relation) {
+		log.Debugf("RECONCILE EXISTS - UPDATE Relation error %s/%s %+v", request.Namespace, request.Name, relation)
+		return r.reconcileUpdate(relation)
+	}
+	log.Debugf("RECONCILE NOT EXISTS - CREATE Relation error %s/%s %+v", request.Namespace, request.Name, relation)
+	return r.reconcileCreate(relation)
 }
 
 func (r *Reconciler) reconcileCreate(relation *v1beta1.Relation) (reconcile.Result, error) {
-	// If the relation's Kind is available, set the Kind as the relation's owner
-	kind := &v1beta1.Kind{}
-	name := types.NamespacedName{
-		Namespace: relation.Namespace,
-		Name:      relation.Spec.Kind.Name,
-	}
-	err := r.client.Get(context.TODO(), name, kind)
-	if err != nil && !k8serrors.IsNotFound(err) {
-		return reconcile.Result{}, err
-	} else if err == nil {
-		err := controllerutil.SetOwnerReference(kind, relation, r.scheme)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
-
-		err = r.client.Update(context.TODO(), relation)
-		if err != nil {
-			if k8serrors.IsNotFound(err) {
-				return reconcile.Result{}, nil
-			}
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
-	}
-
 	// Add the finalizer to the relation if necessary
 	if !k8s.HasFinalizer(relation, topoFinalizer) {
-		k8s.AddFinalizer(relation, topoFinalizer)
+		controllerutil.AddFinalizer(relation, topoFinalizer)
 		err := r.client.Update(context.TODO(), relation)
 		if err != nil {
+			log.Warnf("RELATION FAILED finalizer update requeueing %#v", err.Error())
 			return reconcile.Result{}, err
 		}
 	}
 
-	// Connect to the topology service
-	conn, err := grpc.ConnectService(r.client, relation.Namespace, topoService)
+	resp, err := r.createRelation(relation)
+	if err != nil {
+		log.Warnf("failed RELATION CREATE requeueing %#v", err)
+		return reconcile.Result{}, err
+	}
+
+	log.Infof("SUCCESS Reconciling CREATE RELATION %s", relation.Name)
+	log.Debugf("SUCCESS Reconciling CREATE RELATION %+v %+v", relation, resp)
+	return reconcile.Result{}, nil
+}
+
+func (r *Reconciler) reconcileUpdate(relation *v1beta1.Relation) (reconcile.Result, error) {
+	getTopoResp, err := r.topoClient.Get(context.TODO(), &topo.GetRequest{ID: topo.ID(relation.Name)})
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	defer conn.Close()
 
-	client := topo.NewTopoClient(conn)
+	// resp, err := r.updateRelation(relation, getTopoResp.Object.GetRevision())
+	if tRel := getTopoResp.GetObject().GetRelation(); tRel != nil {
+		log.Debugf("Reconciling update RELATION %+v %+v", relation, getTopoResp)
+		// prune out invalid requests
+		if tRel.KindID != topo.ID(relation.Spec.Kind.Name) {
+			return reconcile.Result{}, errors.NewInvalid("can not update kind on relation object, must be new instatiation")
+		}
 
-	// Check if the relation exists in the topology and exit reconciliation if so
-	if exists, err := r.relationExists(relation, client); err != nil {
-		return reconcile.Result{}, err
-	} else if exists {
-		return reconcile.Result{}, nil
+		if tRel.SrcEntityID != topo.ID(relation.Spec.Source.Name) ||
+			tRel.TgtEntityID != topo.ID(relation.Spec.Target.Name) {
+			log.Debugf("Change to spec in  update RELATION %+v %+v", relation, tRel)
+
+			rUpdateVal := getTopoResp.Object.GetRevision() + 1
+			log.Debugf("Change to revision in  update RELATION %+v %+v", relation, rUpdateVal)
+			_, err = r.updateRelation(relation, rUpdateVal)
+			if err != nil {
+				log.Warnf("failed RELATION UPDATE requeueing %#v", err.Error())
+				return reconcile.Result{}, err
+			}
+		}
 	}
 
-	// If the relation does not exist, create it
-	if err := r.createRelation(relation, client); err != nil {
-		return reconcile.Result{}, err
-	}
+	log.Infof("SUCCESS UPDATE Reconciling RELATION %s", relation.Name)
+
 	return reconcile.Result{}, nil
 }
 
@@ -172,102 +187,58 @@ func (r *Reconciler) reconcileDelete(relation *v1beta1.Relation) (reconcile.Resu
 		return reconcile.Result{}, nil
 	}
 
-	// Connect to the topology service
-	conn, err := grpc.ConnectService(r.client, relation.Namespace, topoService)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	defer conn.Close()
-
-	client := topo.NewTopoClient(conn)
-
 	// Delete the relation from the topology
-	if err := r.deleteRelation(relation, client); err != nil {
+	if err := r.deleteRelation(relation); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// Once the relation has been deleted, remove the topology finalizer
-	k8s.RemoveFinalizer(relation, topoFinalizer)
+	controllerutil.RemoveFinalizer(relation, topoFinalizer)
 	if err := r.client.Update(context.TODO(), relation); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
 }
 
-func (r *Reconciler) relationExists(relation *v1beta1.Relation, client topo.TopoClient) (bool, error) {
-	request := &topo.GetRequest{
-		ID: topo.ID(relation.Name),
-	}
-	_, err := client.Get(context.TODO(), request)
-	if err == nil {
-		return true, nil
-	}
-
-	stat, ok := status.FromError(err)
-	if !ok {
-		return false, err
-	}
-
-	err = errors.FromStatus(stat)
-	if !errors.IsNotFound(err) {
-		return false, err
-	}
-	return false, nil
+func (r *Reconciler) relationExists(relation *v1beta1.Relation) bool {
+	_, err := r.topoClient.Get(context.TODO(), &topo.GetRequest{ID: topo.ID(relation.Name)})
+	return err == nil
 }
 
-func (r *Reconciler) createRelation(relation *v1beta1.Relation, client topo.TopoClient) error {
-	request := &topo.CreateRequest{
-		Object: &topo.Object{
-			ID:   topo.ID(relation.Name),
-			Type: topo.Object_RELATION,
-			Obj: &topo.Object_Relation{
-				Relation: &topo.Relation{
-					KindID:      topo.ID(relation.Spec.Kind.Name),
-					SrcEntityID: topo.ID(relation.Spec.Source.Name),
-					TgtEntityID: topo.ID(relation.Spec.Target.Name),
-				},
+func (r *Reconciler) updateRelation(relation *v1beta1.Relation, revision topo.Revision) (*topo.UpdateResponse, error) {
+	request := &topo.UpdateRequest{Object: &topo.Object{
+		Revision: revision,
+		ID:       topo.ID(relation.Name),
+		Type:     topo.Object_RELATION,
+		Obj: &topo.Object_Relation{
+			Relation: &topo.Relation{
+				KindID:      topo.ID(relation.Spec.Kind.Name),
+				SrcEntityID: topo.ID(relation.Spec.Source.Name),
+				TgtEntityID: topo.ID(relation.Spec.Target.Name),
 			},
-			Attributes: relation.Spec.Attributes,
 		},
-	}
-
-	_, err := client.Create(context.TODO(), request)
-	if err == nil {
-		return nil
-	}
-
-	stat, ok := status.FromError(err)
-	if !ok {
-		return err
-	}
-
-	err = errors.FromStatus(stat)
-	if !errors.IsAlreadyExists(err) {
-		return err
-	}
-	return nil
+		Attributes: relation.Spec.Attributes,
+	}}
+	return r.topoClient.Update(context.TODO(), request)
+}
+func (r *Reconciler) createRelation(relation *v1beta1.Relation) (*topo.CreateResponse, error) {
+	request := &topo.CreateRequest{Object: &topo.Object{
+		ID:   topo.ID(relation.Name),
+		Type: topo.Object_RELATION,
+		Obj: &topo.Object_Relation{
+			Relation: &topo.Relation{
+				KindID:      topo.ID(relation.Spec.Kind.Name),
+				SrcEntityID: topo.ID(relation.Spec.Source.Name),
+				TgtEntityID: topo.ID(relation.Spec.Target.Name),
+			},
+		},
+		Attributes: relation.Spec.Attributes,
+	}}
+	return r.topoClient.Create(context.TODO(), request)
 }
 
-func (r *Reconciler) deleteRelation(relation *v1beta1.Relation, client topo.TopoClient) error {
-	request := &topo.DeleteRequest{
-		ID: topo.ID(relation.Name),
-	}
-
-	_, err := client.Delete(context.TODO(), request)
-	if err == nil {
-		return nil
-	}
-
-	stat, ok := status.FromError(err)
-	if !ok {
-		return err
-	}
-
-	err = errors.FromStatus(stat)
-	if !errors.IsNotFound(err) {
-		return err
-	}
-	return nil
+func (r *Reconciler) deleteRelation(relation *v1beta1.Relation) error {
+	_, err := r.topoClient.Delete(context.TODO(), &topo.DeleteRequest{ID: topo.ID(relation.Name)})
+	return err
 }
 
 type kindMapper struct {
