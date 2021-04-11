@@ -1,0 +1,16 @@
+
+set -euo pipefail
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/topo-operator/_output/bin/topo-operator ./cmd/topo-operator
+
+docker build . -f build/topo-operator/Dockerfile -t suntopo/ops:latest
+
+docker tag suntopo/ops:latest gcr.io/hotbox-sunos/topo-operator 
+docker push gcr.io/hotbox-sunos/topo-operator 
+kubectl set image deploy/topo-operator controller=$(docker inspect gcr.io/hotbox-sunos/topo-operator  | jq -r '.[].RepoDigests[]')
+
+
+
+
+# && k set image deploy topo-operator controller=gcr.io/hotbox-sunos/topo-operator &&\
+#make images &&\
